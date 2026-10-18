@@ -152,6 +152,7 @@ func newMemoryCmd() *cobra.Command {
 		withRun(leaf("verify", "Verify the memory revision hash chain", cobra.NoArgs), runMemoryVerify),
 		withRun(leaf("browse", "Browse shared memory: entries by kind, search, history", cobra.NoArgs), runMemoryBrowse),
 		newMemoryIndexCmd(),
+		newMemoryComputeCmd(),
 		newMemoryListCmd(),
 		withRun(leaf("export <dir>", "Export durable memories as an Agent Memory Repo (MEMORY.md and one file per kind)", cobra.ExactArgs(1)), runMemoryExport),
 		withRun(leaf("import <file-or-dir>", "Import Agent Memory Repo files as candidate memories", cobra.ExactArgs(1)), runMemoryImport),

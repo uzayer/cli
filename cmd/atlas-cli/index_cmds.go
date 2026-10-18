@@ -46,10 +46,22 @@ func runMemoryIndex(cmd *cobra.Command, _ []string) error {
 	bg, _ := cmd.Flags().GetBool("background")
 	noDL, _ := cmd.Flags().GetBool("no-download")
 	if bg {
-		_, err := indexMemory(ctx, p.Root, p.ScopeRoot, false, func(string) {}, func(float64) {})
-		if err != nil && !errors.Is(err, errIndexBusy) {
-			// The hooks log is where background work reports.
-			fmt.Fprintln(cmd.ErrOrStderr(), "atlas-cli: memory index:", err)
+		release, ok := background(ctx)
+		if !ok {
+			return nil
+		}
+		defer release()
+		// Passes asked for while this one ran left the mark: one more
+		// covers them (a few at most: a hook storm waits for the next).
+		for pass := 0; pass < maxBackgroundPasses && (pass == 0 || indexPending(p.Root)); pass++ {
+			_, err := indexMemory(ctx, p.Root, p.ScopeRoot, false, func(string) {}, func(float64) {})
+			if err != nil {
+				if !errors.Is(err, errIndexBusy) {
+					// The hooks log is where background work reports.
+					fmt.Fprintln(cmd.ErrOrStderr(), "atlas-cli: memory index:", err)
+				}
+				return nil
+			}
 		}
 		return nil
 	}
@@ -64,6 +76,7 @@ var errIndexBusy = errors.New("another index pass is running")
 // corpus. One pass per Project at a time.
 func indexMemory(ctx context.Context, root, scope string, download bool, step tui.StepFunc, frac tui.FracFunc) (string, error) {
 	if !project.MemorySharing(scope) {
+		_ = os.Remove(clistate.Path(root, indexPendingFile))
 		return "Shared memory is off here (atlas-cli memory enable); nothing to index.", nil
 	}
 	lock, err := os.OpenFile(clistate.Path(root, "index.lock"), os.O_CREATE|os.O_RDWR, 0o600)
@@ -75,8 +88,18 @@ func indexMemory(ctx context.Context, root, scope string, download bool, step tu
 		return "", errIndexBusy
 	}
 	defer func() { _ = unix.Flock(int(lock.Fd()), unix.LOCK_UN) }()
+	_ = os.Remove(clistate.Path(root, indexPendingFile)) // this pass covers what asked for it
 
-	if !embed.Available() && download {
+	plan := embed.Current()
+	if plan.Backend == embed.CPU && download && embed.LoadError() != nil {
+		// Damaged files are kept by a download (it fetches what is missing):
+		// they go first. The app's copy is the same files, as damaged.
+		step("The model files here do not load; downloading them again")
+		if err := embed.Remove(); err != nil {
+			return "", err
+		}
+	}
+	if plan.Backend == embed.CPU && !embed.Available() && download {
 		step("Downloading the memory search model (" + embed.Size + ", shared with the Atlas app)")
 		if err := embed.Download(ctx, func(done, total int64) {
 			if total > 0 {
@@ -121,14 +144,54 @@ func indexMemory(ctx context.Context, root, scope string, download bool, step tu
 	msg := fmt.Sprintf("Memory index ready: %d documents (%d new, %d changed, %d removed); %d memories embedded.",
 		len(docs), stats.Added, stats.Updated, stats.Deleted, embedded)
 	if vectors == nil {
-		msg += " No model on this machine: keyword search only (atlas-cli memory index downloads it)."
+		switch plan.Backend {
+		case embed.Off:
+			msg += " Keyword search only (" + plan.Note + ")."
+		case embed.CPU:
+			if err := embed.LoadError(); err != nil {
+				msg += fmt.Sprintf(" The model files do not load (%v): keyword search only (atlas-cli memory index downloads them again).", err)
+			} else {
+				msg += " No model on this machine: keyword search only (atlas-cli memory index downloads it)."
+			}
+		}
 	}
 	return msg, nil
 }
 
+// maxBackgroundPasses bounds one background run's passes.
+const maxBackgroundPasses = 5
+
+// indexPendingFile marks a Project whose index a hook asked to refresh.
+const indexPendingFile = "index.pending"
+
+func indexPending(root string) bool {
+	_, err := os.Stat(clistate.Path(root, indexPendingFile))
+	return err == nil
+}
+
+// indexRunning reports that a pass holds the Project's index lock now.
+func indexRunning(root string) bool {
+	f, err := os.OpenFile(clistate.Path(root, "index.lock"), os.O_CREATE|os.O_RDWR, 0o600)
+	if err != nil {
+		return false
+	}
+	defer f.Close()
+	if unix.Flock(int(f.Fd()), unix.LOCK_EX|unix.LOCK_NB) != nil {
+		return true
+	}
+	_ = unix.Flock(int(f.Fd()), unix.LOCK_UN)
+	return false
+}
+
 // spawnIndex runs a background index pass detached, as hooks do after a
-// session (the app indexes when a turn finishes and after extraction).
+// session (the app indexes when a turn finishes and after extraction). It
+// marks the Project first; while a pass runs, the mark is enough: that pass
+// runs once more when it ends.
 func spawnIndex(root string) {
+	_ = os.WriteFile(clistate.Path(root, indexPendingFile), nil, 0o600)
+	if indexRunning(root) {
+		return
+	}
 	self, err := os.Executable()
 	if err != nil {
 		return

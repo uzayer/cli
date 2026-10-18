@@ -1575,3 +1575,83 @@ snapshot from them. README redesigned with the banner
   comparison missed a replaced store. The host and the memory record now
   also hold a handle on the file they opened and treat a link count of 0
   (unlinked) as stale. The tag was moved to the fixed commit.
+
+## Memory search sized to the machine (2026-10-19)
+
+ADR-0014. A small server spent most of the CLI's resources embedding.
+
+Built:
+
+- `internal/embed`: weights memory-mapped and used in place (copied only
+  where unaligned or unmappable); a blocked four-row linear kernel; one
+  `parallel` helper for the linear layers and attention, capped by
+  `SetThreads`. `DetectMachine` (cores as GOMAXPROCS started, which follows
+  a container's CPU limit; memory from sysctl, or MemTotal and the cgroup v1
+  or v2 limit). `Settings` (`compute.json`, env overrides), `Choose` (pure),
+  `Resolve` (endpoint verification against four stored probe vectors, local
+  Ollama discovery in auto), `Current` / `Active` (per process, a minute).
+  An OpenAI-compatible endpoint client that falls back to the CPU, or to
+  keywords on a small machine, for the rest of the process when it fails.
+- `record.Vectors` takes `embed.Active()`.
+- `cmd`: `background` (nice 10 on every thread, GOMAXPROCS at the plan's
+  background cores, a machine-wide `embed.lock` waited on up to ten
+  minutes) for `memory index --background` and `hooks extract`;
+  `index.pending` marks so hooks never start a second pass for a Project
+  while one runs; `memory compute`; a `Search:` line in `atlas-cli status`;
+  Settings ▸ Model shows the plan (read-only; `memory compute` changes it).
+
+Measured on the Intel Mac (8 cores, load average about 3), MiniLM from a
+scratch ATLAS_MODELS_DIR:
+
+| | before | after |
+|---|---|---|
+| allocated loading the model | 177 MB | 4 MB |
+| heap after loading | 89 MB | 3 MB |
+| short query, 1 core | 140–169 ms | 85–92 ms |
+| 512-token document, 1 core | 4.9 s | 3.2–3.4 s |
+| 512-token document, 8 cores | 2.0–2.4 s | 1.6–1.8 s |
+
+Vectors match the previous kernel to about 1e-7, and the stored probe
+vectors to cosine 0.9999 (`TestProbeVectorsAreCurrent`).
+
+Verified live: two Projects' background passes at once ran at nice 10, the
+first at 342% CPU (four of eight cores), the second waiting at 0% and 16 MB
+RSS; a note edited during a pass, with the Project marked, was indexed by
+the same process's second pass. `GOMAXPROCS=1` reads as a small machine:
+keywords only, no download. `memory compute ollama` with no Ollama running
+is refused and nothing is saved.
+
+Edge-case pass (an isolated state directory, the built binary, and a fake
+OpenAI-compatible server that can match, lie, change dimensions, fail, die
+after N requests, hang, and answer Ollama's /api/tags on
+11434). Passed: every mode, flag and override, bad modes refused and nothing
+saved, a corrupt or unknown compute.json read as auto, a read-only state
+directory reported; an endpoint indexing nine documents with no model on
+disk; verdicts reused; a mismatch, other dimensions, a 500 and a 401
+refused; an endpoint dying mid-pass (the rest
+keyword-only, or the CPU with the model there); a LAN endpoint's warning;
+Ollama found in auto (`all-minilm:latest`; `:33m` skipped; a mismatch named
+in status and probed once); hooks marking the Project while a pass runs
+instead of starting another; a one-core background pass at 18 MB and 0.06 s
+against 81 MB and 12 s; the model deleted mid-pass; meaning search finding
+"Signing keys rotate every week" for "credential renewal schedule", keyword
+modes not.
+
+Fixed by it: an explicit `memory compute <url>` reused a day-old rejection
+(now always checks afresh); a hung endpoint stalled each process 10 s (now
+remembered as down for two minutes); a stopped endpoint still read as
+verified (now dialled first); a mismatching local Ollama was skipped
+silently (now named); a damaged model read as "meaning and keywords" and
+was never mended (now said, and re-downloaded by a foreground index); a
+bad mode's note was lost or blamed ATLAS_EMBED; `--model` was kept for
+non-endpoint modes; a save error was bare; tensor errors named a random
+tensor.
+
+Not verified:
+
+- No real Ollama, TEI or vLLM: endpoints were tested against an httptest
+  server and a fake one. Whether Ollama's `all-minilm` passes the probes (its truncation
+  of long texts in particular) is unknown until one is tried.
+- Not run on Linux: cgroup limits and the per-thread renice are covered by
+  unit tests on fixture files only; CI's Linux runners compile and test it.
+- `TestMatchesTheAppsVectors` needs an app-written record and was skipped.

@@ -4,10 +4,17 @@ import (
 	"encoding/binary"
 	"encoding/json"
 	"fmt"
+	"io"
+	"maps"
 	"math"
 	"os"
 	"runtime"
+	"slices"
 	"sync"
+	"sync/atomic"
+	"unsafe"
+
+	"golang.org/x/sys/unix"
 )
 
 // Config is the part of config.json the forward pass needs.
@@ -46,27 +53,46 @@ type Model struct {
 	layers         []layer
 }
 
-// tensors reads a safetensors file: an 8-byte header length, a JSON header
-// of name → {dtype, shape, data_offsets}, then the data.
-func tensors(path string) (map[string][]float32, error) {
-	b, err := os.ReadFile(path) //nolint:gosec // G304: the model's own file
+// tensors maps a safetensors file (an 8-byte header length, a JSON header
+// of name → {dtype, shape, data_offsets}, then the data) read-only. F32
+// tensors are views of the mapping where they are aligned on a
+// little-endian machine (every release target), so nothing is copied and
+// every atlas-cli process shares the file's pages; otherwise, or where the
+// file cannot be mapped, they are copied out. A view outlives the close and
+// the file's removal: Download replaces files by rename, never in place.
+// release unmaps the file, for a caller that will not use the tensors.
+func tensors(path string) (_ map[string][]float32, _ func(), err error) {
+	b, mapped, err := mapFile(path)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
+	views := false
+	unmap := func() {
+		if mapped {
+			_ = unix.Munmap(b)
+			mapped = false
+		}
+	}
+	defer func() {
+		if err != nil || !views {
+			unmap()
+		}
+	}()
 	if len(b) < 8 {
-		return nil, fmt.Errorf("%s: too short", path)
+		return nil, nil, fmt.Errorf("%s: too short", path)
 	}
 	n := binary.LittleEndian.Uint64(b[:8])
 	if n > uint64(len(b)-8) { //nolint:gosec // G115: len(b) ≥ 8 here
-		return nil, fmt.Errorf("%s: bad header", path)
+		return nil, nil, fmt.Errorf("%s: bad header", path)
 	}
 	var hdr map[string]json.RawMessage
 	if err := json.Unmarshal(b[8:8+n], &hdr); err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	data := b[8+n:]
 	out := map[string][]float32{}
-	for name, raw := range hdr {
+	for _, name := range slices.Sorted(maps.Keys(hdr)) { // the same first error each time
+		raw := hdr[name]
 		if name == "__metadata__" {
 			continue
 		}
@@ -75,14 +101,24 @@ func tensors(path string) (map[string][]float32, error) {
 			Offsets [2]int64 `json:"data_offsets"`
 		}
 		if err := json.Unmarshal(raw, &t); err != nil {
-			return nil, err
+			return nil, nil, err
 		}
 		if t.Dtype != "F32" {
 			continue // position_ids (I64) and the like
 		}
 		lo, hi := t.Offsets[0], t.Offsets[1]
 		if lo < 0 || hi > int64(len(data)) || lo > hi || (hi-lo)%4 != 0 {
-			return nil, fmt.Errorf("%s: bad offsets for %s", path, name)
+			return nil, nil, fmt.Errorf("%s: bad offsets for %s", path, name)
+		}
+		if lo == hi {
+			out[name] = []float32{}
+			continue
+		}
+		p := unsafe.Pointer(&data[lo]) //nolint:gosec // G103: a view of the read-only mapping, checked for alignment
+		if mapped && littleEndian && uintptr(p)%4 == 0 {
+			out[name] = unsafe.Slice((*float32)(p), (hi-lo)/4) //nolint:gosec // G103: as above
+			views = true
+			continue
 		}
 		f := make([]float32, (hi-lo)/4)
 		for i := range f {
@@ -90,8 +126,33 @@ func tensors(path string) (map[string][]float32, error) {
 		}
 		out[name] = f
 	}
-	return out, nil
+	return out, unmap, nil
 }
+
+// mapFile maps path read-only, or reads it where it cannot be mapped.
+func mapFile(path string) ([]byte, bool, error) {
+	f, err := os.Open(path) //nolint:gosec // G304: the model's own file
+	if err != nil {
+		return nil, false, err
+	}
+	defer f.Close()
+	fi, err := f.Stat()
+	if err != nil {
+		return nil, false, err
+	}
+	if size := fi.Size(); size > 0 && size == int64(int(size)) {
+		if b, err := unix.Mmap(int(f.Fd()), 0, int(size), unix.PROT_READ, unix.MAP_SHARED); err == nil {
+			return b, true, nil
+		}
+	}
+	b, err := io.ReadAll(f)
+	return b, false, err
+}
+
+var littleEndian = func() bool {
+	x := uint16(1)
+	return *(*byte)(unsafe.Pointer(&x)) == 1 //nolint:gosec // G103: reads the first byte of a local
+}()
 
 // LoadModel reads config.json and model.safetensors.
 func LoadModel(configPath, weightsPath string) (*Model, error) {
@@ -109,7 +170,7 @@ func LoadModel(configPath, weightsPath string) (*Model, error) {
 	if cfg.Hidden == 0 || cfg.Heads == 0 || cfg.Hidden%cfg.Heads != 0 {
 		return nil, fmt.Errorf("config.json: bad sizes")
 	}
-	ts, err := tensors(weightsPath)
+	ts, release, err := tensors(weightsPath)
 	if err != nil {
 		return nil, err
 	}
@@ -145,6 +206,7 @@ func LoadModel(configPath, weightsPath string) (*Model, error) {
 		})
 	}
 	if missing != "" {
+		release() // Default loads again on its next call: no mapping per try
 		return nil, fmt.Errorf("model.safetensors: no tensor %s", missing)
 	}
 	return m, nil
@@ -153,31 +215,86 @@ func LoadModel(configPath, weightsPath string) (*Model, error) {
 // Dim is the embedding size.
 func (m *Model) Dim() int { return m.cfg.Hidden }
 
-// apply computes y = x·Wᵀ + b for n rows, the rows split across cores.
+// apply computes y = x·Wᵀ + b for n rows, the outputs split across cores.
+// Rows go in blocks that stay in cache, four at a time against each weight
+// row, so a weight is loaded once per four products.
 func (l linear) apply(x []float32, n int) []float32 {
 	y := make([]float32, n*l.out)
-	workers := min(runtime.GOMAXPROCS(0), max(l.out/32, 1))
-	var wg sync.WaitGroup
-	chunk := (l.out + workers - 1) / workers
-	for w := range workers {
-		lo, hi := w*chunk, min((w+1)*chunk, l.out)
-		if lo >= hi {
-			continue
+	in := l.in
+	parallel(l.out, 32, func(lo, hi int) {
+		for r0 := 0; r0 < n; r0 += rowBlock {
+			r1 := min(r0+rowBlock, n)
+			for o := lo; o < hi; o++ {
+				wr := l.w[o*in : (o+1)*in]
+				bias := l.b[o]
+				r := r0
+				for ; r+4 <= r1; r += 4 {
+					a, b, c, d := dot4(wr, x[r*in:(r+1)*in], x[(r+1)*in:(r+2)*in], x[(r+2)*in:(r+3)*in], x[(r+3)*in:(r+4)*in])
+					y[r*l.out+o] = a + bias
+					y[(r+1)*l.out+o] = b + bias
+					y[(r+2)*l.out+o] = c + bias
+					y[(r+3)*l.out+o] = d + bias
+				}
+				for ; r < r1; r++ {
+					y[r*l.out+o] = dot(x[r*in:(r+1)*in], wr) + bias
+				}
+			}
 		}
+	})
+	return y
+}
+
+// rowBlock rows of a 384-wide input are 96 KB: they stay in L2 while every
+// output of a chunk passes over them.
+const rowBlock = 64
+
+// dot4 is w·a, w·b, w·c and w·d in one pass over w.
+func dot4(w, a, b, c, d []float32) (float32, float32, float32, float32) {
+	a, b, c, d = a[:len(w)], b[:len(w)], c[:len(w)], d[:len(w)]
+	var sa, sb, sc, sd float32
+	for i, x := range w {
+		sa += x * a[i]
+		sb += x * b[i]
+		sc += x * c[i]
+		sd += x * d[i]
+	}
+	return sa, sb, sc, sd
+}
+
+// threads caps the cores one embedding uses; 0 is every core the process
+// may use.
+var threads atomic.Int32
+
+// SetThreads sets the cap (0 lifts it).
+func SetThreads(n int) { threads.Store(int32(max(n, 0))) } //nolint:gosec // G115: a core count
+
+// workers is how many goroutines one step of a forward pass runs on.
+func workers() int {
+	n := runtime.GOMAXPROCS(0)
+	if t := int(threads.Load()); t > 0 && t < n {
+		return t
+	}
+	return n
+}
+
+// parallel runs fn over [0, n) in at most workers() contiguous chunks of
+// at least minChunk, inline when that is one.
+func parallel(n, minChunk int, fn func(lo, hi int)) {
+	w := min(workers(), max(n/minChunk, 1))
+	if w <= 1 {
+		fn(0, n)
+		return
+	}
+	chunk := (n + w - 1) / w
+	var wg sync.WaitGroup
+	for lo := 0; lo < n; lo += chunk {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			for o := lo; o < hi; o++ {
-				wr := l.w[o*l.in : (o+1)*l.in]
-				bias := l.b[o]
-				for r := range n {
-					y[r*l.out+o] = dot(x[r*l.in:(r+1)*l.in], wr) + bias
-				}
-			}
+			fn(lo, min(lo+chunk, n))
 		}()
 	}
 	wg.Wait()
-	return y
 }
 
 func dot(a, b []float32) float32 {
@@ -244,12 +361,9 @@ func (m *Model) Forward(ids []int32) []float32 {
 	for _, L := range m.layers {
 		q, k, v := L.q.apply(x, n), L.k.apply(x, n), L.v.apply(x, n)
 		ctx := make([]float32, n*h)
-		var wg sync.WaitGroup
-		for hh := range heads {
-			wg.Add(1)
-			go func() {
-				defer wg.Done()
-				scores := make([]float32, n)
+		parallel(heads, 1, func(lo, hi int) {
+			scores := make([]float32, n)
+			for hh := lo; hh < hi; hh++ {
 				for i := range n {
 					qi := q[i*h+hh*hd : i*h+hh*hd+hd]
 					maxS := float32(math.Inf(-1))
@@ -272,9 +386,8 @@ func (m *Model) Forward(ids []int32) []float32 {
 						}
 					}
 				}
-			}()
-		}
-		wg.Wait()
+			}
+		})
 		a := L.o.apply(ctx, n)
 		for i := range a {
 			a[i] += x[i]

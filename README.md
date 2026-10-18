@@ -103,6 +103,11 @@ config. Nothing is ever injected into a prompt: agents pull what they need.
   in pure Go on your machine; nothing is sent anywhere. Ask "how do we rotate
   tokens" and find "signing keys rotate every week". Without the model, search
   falls back to words.
+- **Sized to the machine.** Background indexing runs at a lower priority, on
+  half the cores, one Project at a time. On a small machine (one core, or
+  under 2 GB) search stays on keywords; with a GPU, point it at Ollama or any
+  OpenAI-compatible embeddings server (TEI, vLLM), used once its vectors match
+  the app's model.
 - **Plans are captured, not typed.** When an agent writes its to-do list
   (`TodoWrite`, `update_plan`, `todowrite`, Claude's tasks and plan mode, …),
   it becomes the project's plan, and the next session, or another agent, sees
@@ -117,8 +122,20 @@ config. Nothing is ever injected into a prompt: agents pull what they need.
 
 ```sh
 atlas-cli memory browse   # entries by kind, search, history
-atlas-cli memory index# embed every memory, index the project's documents
+atlas-cli memory index    # embed every memory, index the project's documents
+atlas-cli memory compute  # how this machine embeds: auto, off, cpu, ollama or a URL
 ```
+
+| `atlas-cli memory compute …` | for |
+|---|---|
+| `auto` (default) | the CPU; keywords only on a small machine; a local Ollama with `all-minilm` when found |
+| `off` | keywords only: the model is never loaded |
+| `cpu [--threads N]` | the CPU whatever the machine, on at most N cores |
+| `ollama` | Ollama here (`ollama pull all-minilm`) |
+| `http://gpu-box:8080/v1` | an OpenAI-compatible server on a GPU |
+
+`ATLAS_EMBED`, `ATLAS_EMBED_MODEL` and `ATLAS_EMBED_THREADS` override the
+setting for one environment (CI, a container).
 
 ## Session capture
 
@@ -179,6 +196,7 @@ colour only for status) and prints plain text to pipes and scripts.
 | `atlas-cli sync [on \| off]` | background sync |
 | `atlas-cli serve` | the Project's listener: memory server, sync drain, receiver of hook events |
 | `atlas-cli memory browse \| list \| index \| verify \| export \| import` | shared memory |
+| `atlas-cli memory compute [auto \| off \| cpu \| ollama \| <url>]` | how memory search embeds on this machine |
 | `atlas-cli memory enable \| disable` | the shared-memory gate for this repository |
 | `atlas-cli capture enable \| disable \| sync \| retry \| link` | the capture gate; sync now, retry failed rows, link commits |
 | `atlas-cli update [--check] [--version vX.Y.Z]` | replace this binary with a release, checksum verified |
@@ -190,6 +208,7 @@ colour only for status) and prints plain text to pipes and scripts.
 |---|---|
 | `.atlas/` | the app's per-project files only: `sessions.db`, `blobs/`, `memory/`, `project.json` |
 | `~/.local/state/atlas-cli/projects/<hash>/` | the CLI's own: hook state, `hooks.log`, the listener's run file, preferences |
+| `~/.local/state/atlas-cli/compute.json` | this machine's memory compute setting, and endpoint verdicts beside it |
 | `~/Library/Application Support/dev.atlas.ide/models/` | the local search model, shared with the app (`~/.local/share/…` on Linux) |
 
 ## Development

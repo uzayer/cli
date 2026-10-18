@@ -100,6 +100,16 @@ func Default() (*Embedder, error) {
 	return shared, nil
 }
 
+// LoadError is why the downloaded model does not load; nil when it loads
+// or is not downloaded.
+func LoadError() error {
+	if !Available() {
+		return nil
+	}
+	_, err := Default()
+	return err
+}
+
 // Forget drops the loaded model (after its files were removed).
 func Forget() {
 	sharedMu.Lock()

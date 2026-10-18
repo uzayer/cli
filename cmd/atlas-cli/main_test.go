@@ -55,6 +55,7 @@ var wantCommands = []string{
 	"logout",
 	"mcp-bridge",
 	"memory browse",
+	"memory compute",
 	"memory disable",
 	"memory enable",
 	"memory export",
@@ -114,7 +115,7 @@ var implemented = map[string]bool{
 	"memory verify": true, "memory export": true, "memory import": true, "mcp-bridge": true, "serve": true,
 	"capture link": true, "capture sync": true, "acp import": true, "capture retry": true, "acp run": true, "memory browse": true, "memory list": true,
 	"acp check": true, "acp detect": true, "acp install": true, "acp list": true, "acp sessions": true, "acp logout": true, "acp uninstall": true,
-	"settings": true, "sync": true, "update": true, "uninstall": true, "memory index": true,
+	"settings": true, "sync": true, "update": true, "uninstall": true, "memory index": true, "memory compute": true,
 	"agents add": true, "agents list": true, "agents remove": true, "agents sessions": true,
 	"hooks extract": true, "hooks git post-commit": true,
 }

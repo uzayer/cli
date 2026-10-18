@@ -141,6 +141,7 @@ func runHookExtract(cmd *cobra.Command, _ []string) error {
 	if root == "" || session == "" || !hooks.ValidSessionID(session) {
 		return nil
 	}
+	yield() // detached: a new memory's vector is embedded in the background
 	a, err := newAuth()
 	if err != nil || a == nil {
 		return nil //nolint:nilerr // signed out: the desktop's extractor also needs a sign-in
@@ -164,7 +165,10 @@ func runHookExtract(cmd *cobra.Command, _ []string) error {
 		// New memories: their vectors and documents, as the app reindexes
 		// after an extraction. This process is already detached.
 		if p, perr := project.Discover(ctx, root); perr == nil {
-			_, _ = indexMemory(ctx, p.Root, p.ScopeRoot, false, func(string) {}, func(float64) {})
+			if release, ok := background(ctx); ok {
+				_, _ = indexMemory(ctx, p.Root, p.ScopeRoot, false, func(string) {}, func(float64) {})
+				release()
+			}
 		}
 	}
 	return nil

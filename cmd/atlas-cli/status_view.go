@@ -14,7 +14,7 @@ var statusGroups = []struct {
 	labels []string
 }{
 	{"Account", []string{"Account", "Org"}},
-	{"Project", []string{"Project", "Binding", "Memory at", "Memory", "Capture", "Recorder"}},
+	{"Project", []string{"Project", "Binding", "Memory at", "Memory", "Search", "Capture", "Recorder"}},
 	{"Capture and sync", []string{"Sessions", "Commits", "Sync", "Record"}},
 	{"Agents", []string{"Listener", "Agents", "Git hook", "Hooks", "Hook err"}},
 }

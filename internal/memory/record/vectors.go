@@ -16,15 +16,16 @@ type VectorSource interface {
 	Embed(text string) []float32
 }
 
-// Vectors returns the embedder, or nil when the model is not on this
-// machine: then search is keyword-only and dedup is key-or-hash only, as
-// in the app. Tests replace it.
+// Vectors returns the source this machine's compute plan picks (the local
+// model, or a verified endpoint), or nil when search is keywords only (a
+// small machine, set off, or no model): then search is keyword-only and
+// dedup is key-or-hash only, as in the app. Tests replace it.
 var Vectors = func() VectorSource {
-	e, err := embed.Default()
-	if err != nil {
+	src := embed.Active()
+	if src == nil {
 		return nil
 	}
-	return e
+	return src
 }
 
 // VectorModel is the name vectors are cached under.

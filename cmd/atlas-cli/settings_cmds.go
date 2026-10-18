@@ -247,6 +247,9 @@ func (b *settingsBackend) model(p *project.Project) settings.Section {
 	if have {
 		state = fmt.Sprintf("downloaded · %.0f MB", float64(embed.DiskSize())/1e6)
 		search = "meaning and keywords"
+		if embed.LoadError() != nil {
+			state, search = state+" · damaged", "keywords only"
+		}
 	}
 	sec.Items = []settings.Item{
 		{Label: "Memory model", Value: embed.ModelID + " · " + state,
@@ -254,6 +257,9 @@ func (b *settingsBackend) model(p *project.Project) settings.Section {
 		{Label: "Memory search", Value: search},
 		{Label: "Location", Value: embed.ModelDir(), Detail: "The Atlas app keeps its models here too: one download serves both."},
 	}
+	plan := embed.Current()
+	sec.Items = append(sec.Items, settings.Item{Label: "Compute", Value: describePlan(plan),
+		Detail: "How memory search embeds on " + plan.Machine.String() + " (" + plan.Mode + "). Automatic uses this CPU, or keywords only on a small machine (one core, or under 2 GB), and a local Ollama serving all-minilm when there is one; background passes run at a lower priority, on fewer cores, one at a time. atlas-cli memory compute changes it, or points it at a GPU endpoint."})
 	dl := settings.Item{Key: "model:download", Label: "Download model", Kind: settings.Action, Value: embed.Size,
 		Detail: "Download " + embed.Repo + " (" + embed.Size + ", from Hugging Face, once), then embed this Project's memories and index its documents."}
 	if have {

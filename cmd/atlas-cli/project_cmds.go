@@ -17,6 +17,7 @@ import (
 
 	"github.com/tryatlas/cli/internal/auth"
 	"github.com/tryatlas/cli/internal/capture/store"
+	"github.com/tryatlas/cli/internal/embed"
 	"github.com/tryatlas/cli/internal/hosts"
 	"github.com/tryatlas/cli/internal/ingest"
 	"github.com/tryatlas/cli/internal/memory/record"
@@ -585,6 +586,7 @@ func statusLines(cmd *cobra.Command, w io.Writer) error {
 	}
 	printCaptureHealth(ctx, w, st, p.Root, b)
 	printMemoryHealth(ctx, w, p.ScopeRoot)
+	fmt.Fprintf(w, "Search:    %s\n", describePlan(embed.Current()))
 	printSync(w, p.Root)
 	printAgents(ctx, w, p.Root)
 	return nil
